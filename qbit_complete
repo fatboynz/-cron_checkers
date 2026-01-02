@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# Sends a rich embed message to Discord when a torrent completes and then filebot.
+#
+# Usage:
+#   Configure qBittorrent → Options → Downloads → Run external program:
+#   /usr/local/bin/qbittorrent_discord_complete.sh "%N" "%L" "%F" "%Z"
+#
+# Placeholders:
+#   %N = Torrent name
+#   %L = Torrent category/label
+#   %F = Content path (root download folder)
+#   %Z = Torrent size
+
+# -------- CONFIG --------
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-https://discord.com/api/webhooks/REPLACE_ME}"
+USERNAME="${USERNAME:-Wendy NAS qBittorrent}"
+AVATAR_URL="${AVATAR_URL:-https://upload.wikimedia.org/wikipedia/commons/6/66/QBittorrent_Logo.svg}"
+TIMEOUT_SECS="${TIMEOUT_SECS:-8}"
+LOG_FILE="${LOG_FILE:-}"   # optional, e.g. /var/log/qbit_discord_complete.log
+
+# FileBot
+FILEBOT_BIN="${FILEBOT_BIN:-/usr/local/bin/filebot}"
+FILEBOT_OUTPUT="${FILEBOT_OUTPUT:-/srv/TVShows}"
+
+# -------- ARGS ---------
+TORRENT_NAME="${1:-}"
+TORRENT_LABEL="${2:-}"
+TORRENT_PATH="${3:-}"
+TORRENT_SIZE="${4:-}"
+
+# -------- Helpers --------
+log() {
+  [[ -n "$LOG_FILE" ]] || return 0
+  printf '[%s] %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+json_escape() {
+  python3 - <<'PY' "$1"
+import json, sys
+print(json.dumps(sys.argv[1])[1:-1])
+PY
+}
+
+truncate() {
+  local s="$1" max="$2"
+  if (( ${#s} > max )); then
+    printf '%s…' "${s:0:max-1}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Extra context: host + filesystem + free space at destination
+HOST="$(hostname)"
+MOUNT_SRC=""
+FSTYPE=""
+FREE_HUMAN=""
+if command -v findmnt >/dev/null 2>&1 && [[ -n "$TORRENT_PATH" ]]; then
+  MP="$(df -P "$TORRENT_PATH" 2>/dev/null | awk 'NR==2{print $6}')"
+  if [[ -n "$MP" ]]; then
+    MOUNT_SRC="$(findmnt -rn -o SOURCE "$MP" 2>/dev/null || true)"
+    FSTYPE="$(findmnt -rn -o FSTYPE "$MP" 2>/dev/null || true)"
+    FREE_HUMAN="$(df -hP "$MP" 2>/dev/null | awk 'NR==2{print $4 " free of " $2}')"
+  fi
+fi
+
+LABEL_DISPLAY="${TORRENT_LABEL:-None}"
+
+# Escape + truncate for Discord limits
+ESC_NAME="$(json_escape "$(truncate "$TORRENT_NAME" 900)")"
+ESC_LABEL="$(json_escape "$(truncate "$LABEL_DISPLAY" 200)")"
+ESC_SIZE="$(json_escape "$(truncate "${TORRENT_SIZE:-Unknown}" 64)")"
+ESC_PATH_RAW="$(truncate "$TORRENT_PATH" 900)"
+ESC_PATH="$(json_escape "$ESC_PATH_RAW")"
+
+CONTEXT="Host: $HOST"
+[[ -n "$FSTYPE" ]] && CONTEXT+=" • FS: $FSTYPE"
+[[ -n "$MOUNT_SRC" ]] && CONTEXT+=" • Dev: $MOUNT_SRC"
+[[ -n "$FREE_HUMAN" ]] && CONTEXT+=" • $FREE_HUMAN"
+ESC_CONTEXT="$(json_escape "$(truncate "$CONTEXT" 1024)")"
+
+# -------- PAYLOAD -------
+json_payload=$(
+cat <<EOF
+{
+  "username": "$(json_escape "$USERNAME")",
+  "avatar_url": "$(json_escape "$AVATAR_URL")",
+  "embeds": [{
+    "title": "✅ Torrent Completed",
+    "description": "A torrent has finished downloading successfully.",
+    "color": 3066993,
+    "thumbnail": { "url": "$(json_escape "$AVATAR_URL")" },
+    "fields": [
+      { "name": "📝 Name", "value": "${ESC_NAME}", "inline": false },
+      { "name": "🏷️ Label", "value": "${ESC_LABEL}", "inline": true },
+      { "name": "💾 Size", "value": "${ESC_SIZE}", "inline": true },
+      { "name": "📍 Path", "value": "\`${ESC_PATH}\`", "inline": false },
+      { "name": "🖥️ Storage", "value": "${ESC_CONTEXT}", "inline": false }
+    ],
+    "footer": {
+      "text": "qBittorrent • Torrent Completed",
+      "icon_url": "$(json_escape "$AVATAR_URL")"
+    },
+    "timestamp": "$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  }]
+}
+EOF
+)
+
+# -------- SEND DISCORD ----------
+if [[ -n "$DISCORD_WEBHOOK_URL" && "$DISCORD_WEBHOOK_URL" != *"REPLACE_ME"* ]]; then
+  HTTP_CODE="$(curl -sS -m "$TIMEOUT_SECS" -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X POST -d "$json_payload" "$DISCORD_WEBHOOK_URL" || true)"
+
+  if [[ "$HTTP_CODE" != "204" && "$HTTP_CODE" != "200" ]]; then
+    log "Discord POST failed http=$HTTP_CODE Name=$TORRENT_NAME Path=$TORRENT_PATH"
+  fi
+else
+  log "Webhook not set; skipping Discord. Name=$TORRENT_NAME Path=$TORRENT_PATH"
+fi
+
+# -------- FILEBOT (END) ----------
+# NOTE: FileBot generally wants a PATH to the completed files, not the torrent name.
+# We prefer TORRENT_PATH if provided, otherwise fall back to $1.
+FILEBOT_INPUT="${TORRENT_PATH:-$TORRENT_NAME}"
+
+if [[ -x "$FILEBOT_BIN" ]]; then
+  log "Running FileBot: input=$FILEBOT_INPUT output=$FILEBOT_OUTPUT"
+  "$FILEBOT_BIN" "$FILEBOT_INPUT" \
+    -script fn:amc \
+    --output "$FILEBOT_OUTPUT" \
+    --action copy \
+    -non-strict \
+    --conflict skip \
+    --def movieDB=TheMovieDB seriesDB=TheTVDB \
+    >>"${LOG_FILE:-/dev/null}" 2>&1 || log "FileBot failed rc=$?"
+else
+  log "FileBot not found/executable at $FILEBOT_BIN; skipping."
+fi
+
+exit 0
